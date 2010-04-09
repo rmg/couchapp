@@ -1,45 +1,49 @@
 # -*- coding: utf-8 -*-
 #
-# Copyright 2008,2009 Benoit Chesneau <benoitc@e-engura.org>
-#
-#  Licensed under the Apache License, Version 2.0 (the "License");
-#  you may not use this file except in compliance with the License.
-#  You may obtain a copy of the License at#
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-#  Unless required by applicable law or agreed to in writing, software
-#  distributed under the License is distributed on an "AS IS" BASIS,
-#  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-#  See the License for the specific language governing permissions and
-#  limitations under the License.
+# This file is part of couchapp released under the Apache 2 license. 
+# See the NOTICE for more information.
 
+
+from __future__ import with_statement
 import base64
+import logging
 import mimetypes
 import os
 import os.path
 import re
-
+import webbrowser
 # import json
 try:
     import json
 except ImportError:
     import couchapp.simplejson as json
-    
-from couchapp.errors import *
-from couchapp.macros import *
-from couchapp.utils import relpath
 
-re_backslash = re.compile('\\\\')
-def _replace_backslash(fname):
-    return re_backslash.sub('/', fname)
+from couchapp.errors import ResourceNotFound
+from couchapp.macros import package_shows, package_views
+from couchapp import util
+
+if os.name == 'nt':
+    def _replace_backslash(name):
+        return name.replace("\\", "/")
+else:
+    def _replace_backslash(name):
+        return name
+        
+logger = logging.getLogger(__name__)
 
 class LocalDoc(object):
     
-    def __init__(self, ui, path, create=False):
-        self.ui = ui
+    def __init__(self, path, create=False, docid=None):
         self.docdir = path
-        self.docid = self.get_id()
+        self.ignores = []
+        ignorefile = os.path.join(path, '.couchappignore')
+        if os.path.exists(ignorefile):
+            # A .couchappignore file is a json file containing a
+            # list of regexps for things to skip
+            self.ignores = json.load(open(ignorefile, 'r'))
+        if not docid:
+            docid = self.get_id()
+        self.docid = docid
         self._doc = {'_id': self.docid}
         if create: 
             self.create()
@@ -51,12 +55,9 @@ class LocalDoc(object):
         """
         idfile = os.path.join(self.docdir, '_id')
         if os.path.exists(idfile):
-            docid = self.ui.read(idfile)
+            docid = util.read(idfile).split("\n")[0].strip()
             if docid: return docid
-        elif os.path.exists(os.path.join(self.docdir, '.couchapprc')):
-            return "_design/%s" % os.path.split(self.docdir)[1]
-        
-        return os.path.split(self.docdir)[1]
+        return "_design/%s" % os.path.split(self.docdir)[1]
         
     def __repr__(self):
         return "<%s (%s/%s)>" % (self.__class__.__name__, self.docdir, self.docid)
@@ -65,26 +66,26 @@ class LocalDoc(object):
         return json.dumps(self.doc())
         
     def create(self):
-        if not os.path.isdir(self.docdir) and self.ui.verbose:
-            self.ui.logger.error("%s directory doesn't exist." % self.docdir)
+        if not os.path.isdir(self.docdir):
+            logger.error("%s directory doesn't exist." % self.docdir)
             
         rcfile = os.path.join(self.docdir, '.couchapprc')
         if not os.path.isfile(rcfile):
-            self.ui.write_json(rcfile, {})
-        elif self.ui.verbose:
-            raise AppError("CouchApp already initialized in %s." % self.docdir)
+            util.write_json(rcfile, {})
+        else:
+            logger.info("CouchApp already initialized in %s." % self.docdir)
 
-    def push(self, dbs, noatomic=False):
+    def push(self, dbs, noatomic=False, browser=False, force=False):
         """Push a doc to a list of database `dburls`. If noatomic is true
         each attachments will be sent one by one."""
-        
         for db in dbs:
             self.olddoc = {}
             if noatomic:
                 doc = self.doc(db, with_attachments=False)
-                db.save_doc(doc)
+                db.save_doc(doc, force_update=True)
                 if 'couchapp' in self.olddoc:
-                    old_signatures = self.olddoc['couchapp'].get('signatures', {})
+                    old_signatures = self.olddoc['couchapp'].get('signatures', 
+                                                                {})
                 else:
                     old_signatures = {}
                 
@@ -94,36 +95,28 @@ class LocalDoc(object):
                         cursign = signatures.get(name)
                         if cursign is not None and cursign != signature:
                             db.delete_attachment(doc, name)
-               
-               
                 for name, filepath in self.attachments():
-                    print name not in old_signatures or old_signatures.get(name) != signatures[name]
-                    if name not in old_signatures or old_signatures.get(name) != signatures[name]:
-                        if self.ui.verbose >= 2:
-                            self.ui.logger.info("attach %s " % name)
-                            
-                        print doc['_id']
-                        db.put_attachment(doc, open(filepath, "r"), name=name)
+                    if old_signatures.get(name) != signatures[name] or force:
+                        logger.debug("attach %s " % name)
+                        db.put_attachment(doc, open(filepath, "r"), 
+                                            name=name)
             else:
                 doc = self.doc()
-                try:
-                    olddoc = db.get_doc(self.docid)
-                    doc.update({'_rev': olddoc['_rev']})
-                except ResourceNotFound:
-                    pass
-                db.save_doc(doc)   
-            indexurl = self.index(db.url, doc['couchapp'].get('index'))
+                db.save_doc(doc, force_update=True)
+            indexurl = self.index(db.uri, doc['couchapp'].get('index'))
             if indexurl:
-                self.ui.logger.info("Visit your CouchApp here:\n%s" % indexurl)
+                logger.info("Visit your CouchApp here:\n%s" % indexurl)
+                if browser:
+                    webbrowser.open_new_tab(indexurl)            
                         
     def doc(self, db=None, with_attachments=True):
         """ Function to reetrieve document object from
-        document directory. If `with_attachments`is True
+        document directory. If `with_attachments` is True
         attachments will be included and encoded"""
         
         manifest = []
         objects = {}
-        self._doc = {'_id': self.get_id()}
+        self._doc = {'_id': self.docid}
         
         # get designdoc
         self._doc.update(self.dir_to_fields(self.docdir, manifest=manifest))
@@ -135,16 +128,16 @@ class LocalDoc(object):
         signatures = {}
         attachments = {}
         for name, filepath in self.attachments():
-            signatures[name] = self.ui.sign(filepath)
+            signatures[name] = util.sign(filepath)
             if with_attachments:
-                if self.ui.verbose >= 2:
-                    self.ui.logger.info("attach %s " % name)
+                logger.debug("attach %s " % name)
                 attachments[name] = {}
-                f = open(filepath, "rb")
-                re_sp = re.compile('\s')
-                attachments[name]['data'] = re_sp.sub('', base64.b64encode(f.read()))
-                f.close()
-                attachments[name]['content_type'] = ';'.join(filter(None, mimetypes.guess_type(name)))
+                with open(filepath, "rb") as f:
+                    re_sp = re.compile('\s')
+                    attachments[name]['data'] = re_sp.sub('', 
+                                        base64.b64encode(f.read()))
+                attachments[name]['content_type'] = ';'.join(filter(None, 
+                                            mimetypes.guess_type(name)))
         
         if with_attachments: 
             self._doc['_attachments'] = attachments
@@ -159,11 +152,14 @@ class LocalDoc(object):
         if self.docid.startswith('_design/'):  # process macros
             for funs in ['shows', 'lists', 'updates', 'filters']:
                 if funs in self._doc:
-                    package_shows(self._doc, self._doc[funs], self.docdir, objects, self.ui)
+                    package_shows(self._doc, self._doc[funs], self.docdir, 
+                            objects)
             
             if 'validate_doc_update' in self._doc:
-                tmp_dict = dict(validate_doc_update=self._doc["validate_doc_update"])
-                package_shows( self._doc, tmp_dict, self.docdir, objects, self.ui)
+                tmp_dict = dict(validate_doc_update=self._doc[
+                                                    "validate_doc_update"])
+                package_shows( self._doc, tmp_dict, self.docdir, 
+                    objects)
                 self._doc.update(tmp_dict)
 
             if 'views' in  self._doc:
@@ -185,18 +181,27 @@ class LocalDoc(object):
                     else:
                         del manifest[dmanifest["views/%s" % vname]]
                 self._doc['views'] = views
-                package_views(self._doc,self._doc["views"], self.docdir, objects, self.ui)
+                package_views(self._doc,self._doc["views"], self.docdir, 
+                        objects)
         
         self.olddoc = {}
         if db is not None:
             try:
-                self.olddoc = db.get_doc(self._doc['_id'])
+                self.olddoc = db.open_doc(self._doc['_id'])
                 self._doc.update({'_rev': self.olddoc['_rev']})
             except ResourceNotFound:
                 pass
             
         return self._doc
-                
+    
+    def check_ignore(self, item):
+        for i in self.ignores:
+            match = re.match(i, item)
+            if match:
+                logger.debug("ignoring %s" % item)
+                return True
+        return False
+    
     def dir_to_fields(self, current_dir='', depth=0,
                 manifest=[]):
         """ process a directory and get all members """        
@@ -206,8 +211,10 @@ class LocalDoc(object):
             current_dir = self.docdir
         for name in os.listdir(current_dir):
             current_path = os.path.join(current_dir, name)
-            rel_path = relpath(current_path, self.docdir)
+            rel_path = _replace_backslash(util.relpath(current_path, self.docdir))
             if name.startswith("."):
+                continue
+            elif self.check_ignore(name):
                 continue
             elif depth == 0 and name.startswith('_'):
                 # files starting with "_" are always "special"
@@ -222,7 +229,7 @@ class LocalDoc(object):
                         depth=depth+1, manifest=manifest)
                 else:
                     manifest.append(rel_path)
-                    content = self.ui.read_json(current_path)
+                    content = util.read_json(current_path)
                     if not isinstance(content, dict):
                         content = { "meta": content }
                 if 'signatures' in content:
@@ -246,35 +253,35 @@ class LocalDoc(object):
                 fields[name] = self.dir_to_fields(current_path,
                         depth=depth+1, manifest=manifest)
             else:
-                if self.ui.verbose >= 2:
-                    self.ui.logger.info("push %s" % rel_path)
+                logger.debug("push %s" % rel_path)
                   
                 content = ''  
                 if name.endswith('.json'):
                     try:
-                        content = self.ui.read_json(current_path)
+                        content = util.read_json(current_path)
                     except ValueError:
-                        if self.ui.verbose >= 2:
-                            self.ui.logger.error("Json invalid in %s" % current_path)           
+                        logger.error("Json invalid in %s" % current_path)           
                 else:
                     try:
-                        content = self.ui.read(current_path)
+                        content = util.read(current_path)
                     except UnicodeDecodeError, e:
-                        self.ui.logger.error("%s isn't encoded in utf8" % current_path)
-                        content = self.ui.read(current_path, utf8=False)
+                        logger.warning("%s isn't encoded in utf8" % current_path)
+                        content = util.read(current_path, utf8=False)
                         try:
                             content.encode('utf-8')
                         except UnicodeError, e:
-                            self.ui.logger.error("plan B didn't work, %s is a binary" % current_path)
-                            self.ui.logger.error("use plan C: encode to base64")   
-                            content = "base64-encoded;%s" % base64.b64encode(content)
+                            logger.warning(
+                            "plan B didn't work, %s is a binary" % current_path)
+                            logger.warning("use plan C: encode to base64")   
+                            content = "base64-encoded;%s" % base64.b64encode(
+                                                                        content)
 
                 
                 # remove extension
                 name, ext = os.path.splitext(name)
                 if name in fields and ext in ('.txt'):
-                    if self.ui.verbose >= 2:
-                        self.ui.logger.error("%(name)s is already in properties. Can't add (%(name)s%(ext)s)" % {
+                    logger.warning(
+        "%(name)s is already in properties. Can't add (%(name)s%(ext)s)" % {
                             "name": name, "ext": ext })
                 else:
                     manifest.append(rel_path)
@@ -289,13 +296,17 @@ class LocalDoc(object):
                 for dirname in dirs:
                     if dirname.startswith('.'):
                         dirs.remove(dirname)
+                    elif self.check_ignore(dirname):
+                        dirs.remove(dirname)
                 if files:
                     for filename in files:
                         if filename.startswith('.'):
                             continue
+                        elif self.check_ignore(filename):
+                            continue
                         else:
                             filepath = os.path.join(root, filename)
-                            name = relpath(filepath, path)
+                            name = util.relpath(filepath, path)
                             if vendor is not None:
                                 name = os.path.join('vendor', vendor, name)
                             name = _replace_backslash(name)
@@ -316,8 +327,7 @@ class LocalDoc(object):
             yield attachment
         vendordir = os.path.join(self.docdir, 'vendor')
         if not os.path.isdir(vendordir):
-            if self.ui.verbose >=2:
-                self.ui.logger.info("%s don't exist" % vendordir)
+            logger.warning("%s don't exist" % vendordir)
             return
             
         for name in os.listdir(vendordir):
@@ -325,7 +335,8 @@ class LocalDoc(object):
             if os.path.isdir(current_path):
                 attachdir = os.path.join(current_path, '_attachments')
                 if os.path.isdir(attachdir):
-                    for attachment in self._process_attachments(attachdir, vendor=name):
+                    for attachment in self._process_attachments(attachdir, 
+                                                        vendor=name):
                         yield attachment
     
     def index(self, dburl, index):
@@ -335,5 +346,5 @@ class LocalDoc(object):
             return  "%s/%s/index.html" % (dburl, self.docid)
         return False
         
-def instance(ui, path, create):
-    return LocalDoc(ui, path, create)
+def document(path, create=False, docid=None):
+    return LocalDoc(path, create=create, docid=docid)
